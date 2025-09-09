@@ -1,0 +1,161 @@
+app.js file //line 23991
+//Adithya's FastAPI call
+async function generateAndStoreTestDataMcp(
+  insertedTCs,
+  environmentName,
+  projectId,
+  userId,
+  environmentId
+) {
+  console.log(" [FastAPI Mode] Starting generateAndStoreTestDataMcp");
+  console.log("environmentName:", environmentName);
+  console.log("environmentId:", environmentId);
+  console.log("projectId:", projectId);
+  console.log("userId:", userId);
+  
+  const casesForAgent = insertedTCs.map(({ original, tcId }) => ({
+    ...original,
+    tcId,
+    environmentName,
+    projectId,
+    userId,
+    environmentId,
+  }));
+  console.log("casesForAgent:", JSON.stringify(casesForAgent));
+  console.log(` Processing ${casesForAgent.length} test cases via FastAPI`);
+
+  for (const testCase of casesForAgent) {
+    try {
+      const safeTestCase = JSON.parse(JSON.stringify(testCase));
+      console.log(" Test Case from app.js:", JSON.stringify(safeTestCase));
+      console.log(` Making HTTP request to FastAPI for TC ${testCase.tcId}`);
+      
+      // Make HTTP request to FastAPI instead of spawning process
+      const response = await axios.post('http://localhost:7007/agent/run', {
+        testCase: safeTestCase
+      }, {
+        timeout: 600000, // 10 minute timeout
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        validateStatus: (status) => status < 600 // Don't throw on 4xx/5xx, we'll handle them
+      });
+
+      console.log(` FastAPI Response Status: ${response.status}`);
+      console.log(` FastAPI Response Headers:`, response.headers['content-type']);
+
+      if (response.status === 200 && response.data.success) {
+        const validateData = response.data.data;
+        console.log(" Parsed Output:", JSON.stringify(validateData));
+        
+        const testDataValues = validateData.TestData;
+        console.log(" testDataValues:", JSON.stringify(testDataValues));
+        console.log(` Generated ${testDataValues.length} test data fields for TC ${testCase.tcId}`);
+        
+        if (testDataValues.length) {
+          console.log(` Storing test data for TC ${testCase.tcId}`);
+          await updateTestDataInTestCasetable(JSON.stringify(validateData), testCase.tcId);
+          console.log(` Successfully stored test data for TC ${testCase.tcId}`);
+        } else {
+          console.log(` No test data generated for TC ${testCase.tcId}, storing null`);
+          await updateTestDataInTestCasetable(null, testCase.tcId);
+        }
+      } else {
+        console.error(` FastAPI Error Response:`, response.data);
+        console.error(` Status: ${response.status}, Data:`, JSON.stringify(response.data));
+        
+        // Check for database timeout in FastAPI error response
+        if (response.data.detail && (
+          response.data.detail.includes("ETIMEDOUT") ||
+          response.data.detail.includes("Database connection timeout") ||
+          response.data.detail.includes("FATAL ERROR: Database schema could not be loaded")
+        )) {
+          console.error(" Database connection timeout detected in FastAPI response");
+          console.error(" Please check the DB connection for environment ID:", testCase.environmentId);
+          console.log(" Aborting further processing due to database connection timeout.");
+          break; // Exit the loop early
+        }
+      }
+
+      const safeTcId = String(testCase.tcId).replace(/[\r\n]/g, "");
+      console.log(" Test Data for TC_%s completed:", safeTcId);
+      console.log(" Moving to next test case...\n");
+      
+    } catch (error) {
+      console.error(` Error calling FastAPI for TC ${testCase.tcId}:`, error.message);
+      
+      // Handle specific HTTP errors
+      if (error.code === 'ECONNREFUSED') {
+        console.error(" CRITICAL: FastAPI server is not running on port 7007");
+        console.error(" Please start the FastAPI server: cd testDataMcp && python fastapi_server.py");
+        break; // Stop processing if server is down
+      } else if (error.code === 'ETIMEDOUT') {
+        console.error(" Request timeout - FastAPI server took too long to respond");
+      } else if (error.response?.status === 429) {
+        console.error(" Rate limit exceeded.");
+      } else if (error.response?.status >= 500) {
+        console.error(" Service temporarily unavailable.");
+        console.error("Response:", error.response?.data);
+      } else if (error.response) {
+        console.error(" HTTP Error Response:", error.response.status, error.response.data);
+      }
+      
+      // Continue with next test case unless it's a connection error
+      if (error.code !== 'ECONNREFUSED') {
+        console.log(" Continuing with next test case...");
+      } else {
+        break;
+      }
+    }
+  }
+  
+  console.log(" generateAndStoreTestDataMcp completed");
+}
+
+
+//New code fastapi_server.py inside testDataMcp Folder
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import asyncio
+import json
+import sys
+import os
+import logging 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Add the current directory to Python path to import agent
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from agent import run_agent
+
+app = FastAPI(title="Test Data Generation Agent API")
+
+class TestCaseRequest(BaseModel):
+    testCase: dict
+
+@app.post("/agent/run")
+async def execute_agent(request: TestCaseRequest):
+    """Execute the test data generation agent"""
+    logger.info(f"Received request for test case: {request.testCase.get('tcId', 'unknown')}")
+    try:
+        test_case_json = json.dumps(request.testCase)
+        result = await run_agent(test_case_json)
+        logger.info(f"Agent returned: {len(result.get('TestData', []))} test data entries")
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        logger.info("Request completed successfully")    
+        return {"success": True, "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7007)
+
