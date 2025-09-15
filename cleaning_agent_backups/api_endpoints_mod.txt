@@ -1,0 +1,136 @@
+/////// Gallery access api ////
+app.post(
+  "/api/upload-files",
+  userUpload.array("files"),
+  validateRequest,
+  async (req, res) => {
+    try {
+      const userBrId = req.body.brId;
+      const userProjectId = req.body.projectId;
+      const userFiles = req.files;
+
+      if (!Array.isArray(userFiles) || !userBrId || !userProjectId) {
+        return res.status(400).send({ error: "Invalid request data." });
+      }
+      if (userFiles.length > 50) {
+        return res.status(400).send({ error: "Exceeded maximum number of files allowed (50)." });
+      }
+      const tooLarge = userFiles.filter((f) => f.size > 3 * 1024 * 1024);
+      if (tooLarge.length) {
+        return res.status(400).send({
+          error: `Files too large: ${tooLarge.map((f) => f.originalname).join(", ")}`,
+        });
+      }
+
+      // Load moderation settings
+      const { provider, model, apiKey, policy } = await getModerationSettings(userProjectId);
+
+      // Pre-upload moderation: read each file into buffer
+      for (const file of userFiles) {
+        const buffer = await fs.readFile(file.path);
+        const result = await moderateImage(
+          { buffer, mime: file.mimetype },
+          { provider, apiKey, model, timeoutMs: 15000, policy }
+        );
+
+        if (result.blocked) {
+          return res.status(400).send({
+            error: `Image "${file.originalname}" rejected by safety filter`,
+            reason: result.reason || "Policy violation",
+            flags: result.flags || {},
+          });
+        }
+      }
+
+      // Upload to S3
+      const uploadResults = await Promise.all(
+        userFiles.map(async (file) => {
+          const buffer = await fs.readFile(file.path);
+          const Key = `${userProjectId}/${userBrId}/${file.originalname}`;
+          const data = await s3
+            .upload({
+              Bucket: process.env.AWS_BUCKET_NAME,
+              Key,
+              Body: buffer,
+              ContentType: file.mimetype,
+            })
+            .promise();
+          return data.Location;
+        })
+      );
+
+      // Respond with results
+      res.send({
+        results: [
+          { message: "Files uploaded successfully" },
+          { URIs: uploadResults },
+        ],
+      });
+
+      // Async DB update
+      const finalPath = `s3://${process.env.AWS_BUCKET_NAME}/${userProjectId}/${userBrId}`;
+      const column = "s3StoragePath";
+      db.query(
+        `UPDATE businessRequirements SET ${column} = ? WHERE brId = ?`,
+        [finalPath, userBrId],
+        (err, result) => {
+          if (err) {
+            console.error("DB update error:", err.message);
+          } else if (result.affectedRows === 0) {
+            console.warn("No BR row found for brId:", userBrId);
+          } else {
+            console.log(`✅ ${column} updated for BR ${userBrId}`);
+          }
+        }
+      );
+    } catch (err) {
+      console.error("Upload error:", err);
+      res.status(500).send({ error: err.message });
+    }
+  }
+);
+
+//////////// ProcessTStoTCPrompts API ////////////////////////
+
+console.log("🧹 Sending test cases to cleaning agent...");
+          llmTcResults = await cleanTestCasesWithAgent(llmTcResults, projectId, "test_images");
+          console.log("✅ Test cases cleaned and returned");
+
+//////////// cleanTestCasesWithAgent //////////////////
+
+async function cleanTestCasesWithAgent(testCases, projectId, imageFolder = "test_images") {
+  console.log(`🧹 ===== CLEANING ${testCases.length} TEST CASES =====`);
+  
+  try {
+    const response = await fetch("http://localhost:7007/agent/clean-testcases", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        testCases: testCases,
+        projectId: projectId,
+        imageFolder: imageFolder,
+        mode: "patch"
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    
+    if (result.success) {
+      console.log(`✅ Successfully cleaned ${result.data.totalProcessed} test cases`);
+      return result.data.cleanedTestCases;
+    } else {
+      throw new Error("Cleaning agent returned unsuccessful result");
+    }
+  } catch (error) {
+    console.error("❌ Error calling cleaning agent:", error);
+    console.log("⚠️ Returning original test cases without cleaning");
+    return testCases; // Return original if cleaning fails
+  }
+}
+
